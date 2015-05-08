@@ -1,4 +1,5 @@
 #!/usr/bin/python
+
 # -*- coding: utf-8 -*-
 
 # Copyright (C) 2009-2012:
@@ -42,24 +43,19 @@ from shinken.modulesctx import modulesctx
 # Import a class from the livestatus module, should be already loaded!
 livestatus = modulesctx.get_module('livestatus')
 
-# when livestatus will be correctly setup, replace:
 LiveStatusStack = livestatus.LiveStatusStack
 LOGCLASS_INVALID = livestatus.LOGCLASS_INVALID
 Logline = livestatus.Logline
-# by:
-#from livestatus import LiveStatusStack
-#from livestatus.log_line import LOGCLASS_INVALID, Logline
-
-
 
 try:
-    from pymongo import ReplicaSetConnection, ReadPreference
+    from pymongo import MongoClient, ReadPreference, version
 except ImportError:
-    ReplicaSetConnection = None
+    MongoClient = None
     ReadPreference = None
 from pymongo.errors import AutoReconnect
 
 from shinken.basemodule import BaseModule
+from shinken.objects.module import Module
 from shinken.log import logger
 from shinken.util import to_bool
 
@@ -99,11 +95,10 @@ class LiveStatusLogStoreMongoDB(BaseModule):
         # mongodb://host1,host2,host3/?safe=true;w=2;wtimeoutMS=2000
         self.mongodb_uri = getattr(modconf, 'mongodb_uri', None)
         self.replica_set = getattr(modconf, 'replica_set', None)
-        if self.replica_set and not ReplicaSetConnection:
-            logger.error('[LogStoreMongoDB] Can not initialize LogStoreMongoDB module with '
-                         'replica_set because your pymongo lib is too old. '
-                         'Please install it with a 2.x+ version from '
-                         'https://github.com/mongodb/mongo-python-driver/downloads')
+        # Older versions don't handle replicasets and don't have the fsync option
+        if version < 2:
+            logger.error('[LogStoreMongoDB] Your pymongo lib is too old. '
+                         'Please install at least a 2.x+ version.')
             return None
         self.database = getattr(modconf, 'database', 'logs')
         self.collection = getattr(modconf, 'collection', 'logs')
@@ -146,13 +141,9 @@ class LiveStatusLogStoreMongoDB(BaseModule):
     def open(self):
         try:
             if self.replica_set:
-                self.conn = pymongo.ReplicaSetConnection(self.mongodb_uri, replicaSet=self.replica_set, fsync=self.mongodb_fsync)
+                self.conn = MongoClient(self.mongodb_uri, replicaSet=self.replica_set, fsync=self.mongodb_fsync)
             else:
-                # Old versions of pymongo do not known about fsync
-                if ReplicaSetConnection:
-                    self.conn = pymongo.Connection(self.mongodb_uri, fsync=self.mongodb_fsync)
-                else:
-                    self.conn = pymongo.Connection(self.mongodb_uri)
+                self.conn = MongoClient(self.mongodb_uri, fsync=self.mongodb_fsync)
             self.db = self.conn[self.database]
             self.db[self.collection].ensure_index([('host_name', pymongo.ASCENDING), ('time', pymongo.ASCENDING), ('lineno', pymongo.ASCENDING)], name='logs_idx')
             self.db[self.collection].ensure_index([('time', pymongo.ASCENDING), ('lineno', pymongo.ASCENDING)], name='time_1_lineno_1')
@@ -162,20 +153,21 @@ class LiveStatusLogStoreMongoDB(BaseModule):
                 #self.db.read_preference = ReadPreference.SECONDARY
             self.is_connected = CONNECTED
             self.next_log_db_rotate = time.time()
-        except AutoReconnect as err:
+        except AutoReconnect, exp:
             # now what, ha?
-            logger.error("[LogStoreMongoDB] LiveStatusLogStoreMongoDB.AutoReconnect %s" % err)
+            logger.error("[LogStoreMongoDB] LiveStatusLogStoreMongoDB.AutoReconnect %s" % (exp))
             # The mongodb is hopefully available until this module is restarted
-            raise LiveStatusLogStoreError(err)
-        except Exception as err:
+            raise LiveStatusLogStoreError
+        #except Exception, exp:
+        except Exception as exp:
             # If there is a replica_set, but the host is a simple standalone one
             # we get a "No suitable hosts found" here.
             # But other reasons are possible too.
-            logger.error("[LogStoreMongoDB] Could not open the database: %s" % err)
-            raise LiveStatusLogStoreError(err)
+            logger.error("[LogStoreMongoDB] Could not open the database: %s" % (exp))
+            raise LiveStatusLogStoreError
 
     def close(self):
-        self.conn.disconnect()
+        self.conn.close()
 
     def commit(self):
         pass
@@ -240,7 +232,7 @@ class LiveStatusLogStoreMongoDB(BaseModule):
                 self.backlog.append(values)
             except Exception, exp:
                 self.is_connected = DISCONNECTED
-                logger.error("[LogStoreMongoDB] Databased error occurred: %s" % exp)
+                logger.error("[LogStoreMongoDB] Databased error occurred:" % exp)
             # FIXME need access to this #self.livestatus.count_event('log_message')
         else:
             logger.info("[LogStoreMongoDB] This line is invalid: %s" % line)
